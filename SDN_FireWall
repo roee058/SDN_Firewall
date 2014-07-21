@@ -1,0 +1,202 @@
+# Copyright (C) 2011 Nippon Telegraph and Telephone Corporation.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+# implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import logging
+import struct
+import time
+
+from ryu.base import app_manager
+from ryu.controller import mac_to_port
+from ryu.controller import ofp_event
+from ryu.controller.handler import MAIN_DISPATCHER
+from ryu.controller.handler import set_ev_cls
+from ryu.ofproto import ofproto_v1_0
+from ryu.lib.mac import haddr_to_str
+from ryu.lib.ofctl_v1_0 import get_flow_stats
+from ryu.lib.mac import haddr_to_bin
+from ryu.lib.ip import *
+from ryu.lib.packet import packet
+
+class SimpleSwitch(app_manager.RyuApp):
+    OFP_VERSIONS = [ofproto_v1_0.OFP_VERSION]
+    IPV4_HOST1 = '10.0.0.1';
+    IPV4_HOST2 = '10.0.0.2';
+    IPV4_HOST3 = '10.0.0.3';
+    IPV4_UINT32_HOST1 = 167772161
+    IPV4_UINT32_HOST2 = 167772162
+    IPV4_UINT32_HOST3 = 167772163
+    MAC_HOST1 = haddr_to_bin('00:00:00:00:00:01')
+    MAC_HOST2 = haddr_to_bin('00:00:00:00:00:02')
+    MAC_HOST3 = haddr_to_bin('00:00:00:00:00:03')
+
+    def __init__(self, *args, **kwargs):
+        super(SimpleSwitch, self).__init__(*args, **kwargs)
+        self.mac_to_port = {}
+        self.isInitialize = False
+        self.portHost1 = -1;
+        self.portHost2 = -1;
+        self.portHost3 = -1;
+        self.stats = []
+
+    def add_flow(self, datapath, in_port, dst, actions):
+        ofproto = datapath.ofproto
+
+        wildcards = ofproto_v1_0.OFPFW_ALL
+        wildcards &= ~ofproto_v1_0.OFPFW_IN_PORT
+        wildcards &= ~ofproto_v1_0.OFPFW_DL_DST
+
+        match = datapath.ofproto_parser.OFPMatch(
+            wildcards, in_port, 0, dst,
+            0, 0, 0, 0, 0, 0, 0, 0, 0)
+
+        mod = datapath.ofproto_parser.OFPFlowMod(
+            datapath=datapath, match=match, cookie=0,
+            command=ofproto.OFPFC_ADD, idle_timeout=0, hard_timeout=60,
+            priority=ofproto.OFP_DEFAULT_PRIORITY,
+            flags=ofproto.OFPFF_SEND_FLOW_REM, actions=actions)
+        datapath.send_msg(mod)
+
+    @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
+    def _packet_in_handler(self, ev):
+
+        msg = ev.msg
+        datapath = msg.datapath
+        ofproto = datapath.ofproto
+        dst, src, _eth_type = struct.unpack_from('!6s6sH', buffer(msg.data), 0)
+        dpid = datapath.id
+        
+        # learn the port of host 1 by its mac address
+        if (self.portHost1 == -1 and src == SimpleSwitch.MAC_HOST1):
+            self.portHost1 = msg.in_port
+        
+        #  If the packet is the first one, send statistics request
+        if (not self.isInitialize and self.portHost1 != -1):
+            self.isInitialize = True
+            self._send_port_stats_req(datapath)
+        
+        self.mac_to_port.setdefault(dpid, {})
+        self.logger.info("packet in %s %s %s %s",
+                         dpid, haddr_to_str(src), haddr_to_str(dst),
+                         msg.in_port)
+
+        # learn a mac address to avoid FLOOD next time.
+        self.mac_to_port[dpid][src] = msg.in_port
+
+        if dst in self.mac_to_port[dpid]:
+            out_port = self.mac_to_port[dpid][dst]
+        else:
+            out_port = ofproto.OFPP_FLOOD
+            
+        # if the traffic is between hosts 2 and 3, block it
+        if (self._is_Packet_Need_To_Be_Blocked(msg.data)):
+            actions = []
+            self._block_flow(datapath, SimpleSwitch.IPV4_UINT32_HOST2, SimpleSwitch.IPV4_UINT32_HOST3)
+        else:
+            # install a flow to avoid packet_in next time
+            actions = [datapath.ofproto_parser.OFPActionOutput(out_port)]
+            if out_port != ofproto.OFPP_FLOOD:
+                self.add_flow(datapath, msg.in_port, dst, actions)
+
+        out = datapath.ofproto_parser.OFPPacketOut(
+             datapath=datapath, buffer_id=msg.buffer_id, in_port=msg.in_port,
+             actions=actions)
+        datapath.send_msg(out)
+    
+    def _block_flow(self, datapath, firstHostIP, secondHostIP):
+        '''
+        Block the current flow with rule to the switch
+        @param datapath - msg.datapath type
+        @param firstHostIP - uint32 first host IP to block
+        @param secondHostIP - uint32 second host IP to block
+        '''
+        matches = []
+        ofproto = datapath.ofproto 
+        wildcards = ofproto_v1_0.OFPFW_ALL
+        wildcards &= ~(ofproto_v1_0.OFPFW_NW_SRC_ALL | ofproto_v1_0.OFPFW_NW_DST_ALL)
+            
+        matches.append(datapath.ofproto_parser.OFPMatch(
+            wildcards, 0, 0, 0, 0, 0, 0, 0, 0, 
+            firstHostIP, secondHostIP, 0, 0))
+        matches.append(datapath.ofproto_parser.OFPMatch(
+            wildcards, 0, 0, 0, 0, 0, 0, 0, 0, 
+            secondHostIP, firstHostIP, 0, 0))
+
+        # Set rule with hard timeout and sent it to the switch
+        for match in matches:
+            mod = datapath.ofproto_parser.OFPFlowMod(
+                datapath=datapath, match=match, cookie=0,
+                command=ofproto.OFPFC_ADD, idle_timeout=0, hard_timeout=10,
+                priority=ofproto.OFP_DEFAULT_PRIORITY,
+                flags=ofproto.OFPFF_SEND_FLOW_REM, actions=[])
+            datapath.send_msg(mod)      
+        
+    def _is_Packet_Need_To_Be_Blocked(self, data):    
+        '''
+        Check if the flow is between hosts 2 and 3.
+        @param data - msg.data type
+        @return - True if the flow is between hosts 2 and 3, false otherwise
+        '''
+        dataPacket = packet.Packet(data)
+        for protocol in dataPacket.protocols:
+            if (protocol.protocol_name == 'ipv4' and 
+                ((ipv4_to_str(protocol.src) == SimpleSwitch.IPV4_HOST2 and ipv4_to_str(protocol.dst) == SimpleSwitch.IPV4_HOST3) 
+                or (ipv4_to_str(protocol.src) == SimpleSwitch.IPV4_HOST3 and ipv4_to_str(protocol.dst) == SimpleSwitch.IPV4_HOST2))):
+                return True
+        return False
+
+    @set_ev_cls(ofp_event.EventOFPPortStatus, MAIN_DISPATCHER)
+    def _port_status_handler(self, ev):
+        msg = ev.msg
+        reason = msg.reason
+        port_no = msg.desc.port_no
+
+        ofproto = msg.datapath.ofproto
+        if reason == ofproto.OFPPR_ADD:
+            self.logger.info("port added %s", port_no)
+        elif reason == ofproto.OFPPR_DELETE:
+            self.logger.info("port deleted %s", port_no)
+            if (port_no == self.portHost1):
+                self.logger.info('Host #1 Tx\Rx statistics - %s', self.stats)
+        elif reason == ofproto.OFPPR_MODIFY:
+            self.logger.info("port modified %s", port_no)
+        else:
+            self.logger.info("Illeagal port state %s %s", port_no, reason)
+
+
+    @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
+    def _port_stats_reply_handler(self, ev):
+        '''
+        Handle port statistics reply from the switch
+        @param: ev
+        '''
+        body = ev.msg.body
+        self.stats = []
+        
+        for stat in body:
+            self.stats.append('port_no = %d , Tx_packets = %d , Rx_packets = %d' %
+                         (stat.port_no, stat.rx_packets, #rx of the port 1 is tx for host 1
+                          stat.tx_packets)) #tx of the port 1 is rx for host 1    
+        time.sleep(1)
+        self._send_port_stats_req(ev.msg.datapath) #send request for same statistics again every 1 sec
+       
+    
+    def _send_port_stats_req(self, datapath):
+        '''
+        Send port statistics request to the switch
+        @param: dp - datapath
+        '''
+        ofp = datapath.ofproto
+        ofp_parser = datapath.ofproto_parser
+        req = ofp_parser.OFPPortStatsRequest(datapath, 0, self.portHost1)
+        datapath.send_msg(req)
